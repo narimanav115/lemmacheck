@@ -50,6 +50,14 @@ try:
 except ImportError:
     xlrd = None
 
+# Windows COM support for .doc files
+win32com_client = None
+if platform.system() == 'Windows':
+    try:
+        import win32com.client as win32com_client
+    except ImportError:
+        pass
+
 # Lemmatization
 try:
     import pymorphy3
@@ -135,12 +143,28 @@ def extract_text(filepath: str) -> str:
 
 
 def extract_text_from_doc(filepath: str) -> str:
-    """Extract text from old .doc format using macOS textutil or antiword"""
+    """Extract text from old .doc format using platform-specific methods"""
     import subprocess
     import tempfile
     
-    # Try textutil (macOS built-in)
-    if platform.system() == 'Darwin':
+    system = platform.system()
+    
+    # Windows: use pywin32 COM automation
+    if system == 'Windows':
+        if win32com_client is not None:
+            try:
+                word = win32com_client.Dispatch('Word.Application')
+                word.Visible = False
+                doc = word.Documents.Open(os.path.abspath(filepath))
+                text = doc.Content.Text
+                doc.Close(False)
+                word.Quit()
+                return text
+            except Exception:
+                pass
+    
+    # macOS: use textutil (built-in)
+    if system == 'Darwin':
         try:
             with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as tmp:
                 tmp_path = tmp.name
@@ -153,15 +177,20 @@ def extract_text_from_doc(filepath: str) -> str:
         except Exception:
             pass
     
-    # Try antiword (cross-platform, needs to be installed)
+    # Cross-platform fallback: antiword
     try:
         result = subprocess.run(['antiword', filepath], capture_output=True, text=True, check=True)
         return result.stdout
     except Exception:
         pass
     
-    raise ImportError("Не удалось прочитать .doc файл. На macOS используется textutil, "
-                     "на других системах установите antiword.")
+    # Platform-specific error messages
+    if system == 'Windows':
+        raise ImportError("Не удалось прочитать .doc файл. Установите pywin32: pip install pywin32")
+    elif system == 'Darwin':
+        raise ImportError("Не удалось прочитать .doc файл с помощью textutil.")
+    else:
+        raise ImportError("Не удалось прочитать .doc файл. Установите antiword.")
 
 
 def extract_text_from_xlsx(filepath: str) -> str:
@@ -248,13 +277,37 @@ class LemmaSearchEngine:
         return lemma
 
     def lemmatize(self, text: str) -> List[Tuple[str, str, int]]:
+        """Tokenize and lemmatize text, supporting hyphenated words"""
         words = []
-        for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+', text):
+        # Match words including hyphenated compounds (e.g., "Three-cycle", "научно-технический")
+        for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', text):
             word = match.group()
             position = match.start()
-            lemma = self._lemmatize_word(word)
-            words.append((word, lemma, position))
+            
+            # Handle hyphenated words
+            if '-' in word:
+                # Index the full compound word
+                full_lemma = self._lemmatize_compound(word)
+                words.append((word, full_lemma, position))
+                
+                # Also index individual parts for broader matching
+                parts = word.split('-')
+                offset = 0
+                for part in parts:
+                    if part:
+                        part_lemma = self._lemmatize_word(part)
+                        words.append((part, part_lemma, position + offset))
+                    offset += len(part) + 1  # +1 for hyphen
+            else:
+                lemma = self._lemmatize_word(word)
+                words.append((word, lemma, position))
         return words
+
+    def _lemmatize_compound(self, word: str) -> str:
+        """Lemmatize a hyphenated compound word"""
+        parts = word.split('-')
+        lemmatized_parts = [self._lemmatize_word(part) for part in parts if part]
+        return '-'.join(lemmatized_parts)
 
     def add_document(self, doc_id: str, text: str, filename: str) -> int:
         if doc_id in self.documents:
@@ -301,21 +354,145 @@ class LemmaSearchEngine:
     def search(self, query: str) -> List[Tuple[str, float, str, List[int]]]:
         if not query.strip():
             return []
+        
+        # Parse query for phrases (quoted or multi-word)
+        phrases = self._parse_phrases(query)
+        
         query_words = self.lemmatize(query)
         query_lemmas = set(lemma for _, lemma, _ in query_words if lemma)
         if not query_lemmas:
             return []
+        
         doc_scores: Dict[str, float] = defaultdict(float)
         doc_positions: Dict[str, List[int]] = defaultdict(list)
+        
+        # Find documents containing ALL query lemmas (phrase search)
+        # First, find candidate documents that have at least one lemma
+        candidate_docs: Set[str] = set()
+        for lemma in query_lemmas:
+            if lemma in self.inverted_index:
+                if not candidate_docs:
+                    candidate_docs = set(self.inverted_index[lemma].keys())
+                else:
+                    # Intersect to keep only docs with ALL lemmas
+                    candidate_docs &= set(self.inverted_index[lemma].keys())
+        
+        if not candidate_docs:
+            return []
+        
+        # Calculate TF-IDF for documents that have ALL terms
         for lemma in query_lemmas:
             if lemma in self.inverted_index:
                 for doc_id, positions in self.inverted_index[lemma].items():
-                    doc_scores[doc_id] += self._calculate_tfidf(lemma, doc_id)
-                    doc_positions[doc_id].extend(positions)
+                    if doc_id in candidate_docs:
+                        doc_scores[doc_id] += self._calculate_tfidf(lemma, doc_id)
+                        doc_positions[doc_id].extend(positions)
+        
+        # Boost score for phrase matches (words appearing close together)
+        if len(phrases) > 0:
+            for doc_id in list(doc_scores.keys()):
+                phrase_boost = self._calculate_phrase_boost(doc_id, phrases)
+                doc_scores[doc_id] *= (1 + phrase_boost)
+        
         results = [(doc_id, score, self.documents[doc_id]['filename'], sorted(set(doc_positions[doc_id])))
                    for doc_id, score in doc_scores.items()]
         results.sort(key=lambda x: x[1], reverse=True)
         return results
+
+    def _parse_phrases(self, query: str) -> List[List[str]]:
+        """Parse query into phrases (multi-word sequences)"""
+        phrases = []
+        
+        # Handle quoted phrases first
+        quoted_pattern = r'"([^"]+)"|\'([^\']+)\''
+        for match in re.finditer(quoted_pattern, query):
+            phrase_text = match.group(1) or match.group(2)
+            phrase_lemmas = [lemma for _, lemma, _ in self.lemmatize(phrase_text) if lemma]
+            if len(phrase_lemmas) >= 2:
+                phrases.append(phrase_lemmas)
+        
+        # Remove quoted parts from query
+        remaining_query = re.sub(quoted_pattern, ' ', query)
+        
+        # Split by common phrase delimiters: semicolons, commas
+        parts = re.split(r'[;,]', remaining_query)
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            # Each part with 2+ words is treated as a potential phrase
+            part_lemmas = [lemma for _, lemma, _ in self.lemmatize(part) if lemma]
+            if len(part_lemmas) >= 2:
+                phrases.append(part_lemmas)
+        
+        return phrases
+
+    def _calculate_phrase_boost(self, doc_id: str, phrases: List[List[str]], max_distance: int = 10) -> float:
+        """Calculate boost factor based on how well phrases match in the document"""
+        if doc_id not in self.documents:
+            return 0.0
+        
+        total_boost = 0.0
+        
+        for phrase_lemmas in phrases:
+            if len(phrase_lemmas) < 2:
+                continue
+            
+            # Get positions for each lemma in the phrase
+            lemma_positions = []
+            for lemma in phrase_lemmas:
+                if lemma in self.inverted_index and doc_id in self.inverted_index[lemma]:
+                    lemma_positions.append(self.inverted_index[lemma][doc_id])
+                else:
+                    lemma_positions.append([])
+            
+            # Check if all lemmas are present
+            if any(len(pos) == 0 for pos in lemma_positions):
+                continue
+            
+            # Find sequences where words appear close together
+            phrase_matches = self._find_phrase_matches(lemma_positions, max_distance)
+            
+            if phrase_matches > 0:
+                # Boost based on number of phrase matches and phrase length
+                phrase_boost = phrase_matches * (len(phrase_lemmas) ** 1.5) * 0.5
+                total_boost += phrase_boost
+        
+        return min(total_boost, 5.0)  # Cap the boost
+
+    def _find_phrase_matches(self, lemma_positions: List[List[int]], max_distance: int) -> int:
+        """Find how many times words appear in sequence within max_distance"""
+        if not lemma_positions or not lemma_positions[0]:
+            return 0
+        
+        matches = 0
+        first_positions = lemma_positions[0]
+        
+        for start_pos in first_positions:
+            current_pos = start_pos
+            matched = True
+            
+            for i in range(1, len(lemma_positions)):
+                # Find next lemma position that's after current_pos but within max_distance
+                next_positions = lemma_positions[i]
+                found_next = False
+                
+                for pos in next_positions:
+                    if current_pos < pos <= current_pos + max_distance:
+                        current_pos = pos
+                        found_next = True
+                        break
+                
+                if not found_next:
+                    matched = False
+                    break
+            
+            if matched:
+                matches += 1
+        
+        return matches
 
     def get_context(self, doc_id: str, positions: List[int], context_size: int = 50) -> str:
         if doc_id not in self.documents:
@@ -503,8 +680,8 @@ class LemmaCheckApp(QMainWindow):
         
         # Found words panel
         words_frame = QFrame()
-        words_frame.setMaximumWidth(200)
-        words_frame.setMinimumWidth(150)
+        words_frame.setMaximumWidth(250)
+        words_frame.setMinimumWidth(180)
         words_layout = QVBoxLayout(words_frame)
         words_layout.setContentsMargins(0, 0, 0, 0)
         
@@ -512,23 +689,10 @@ class LemmaCheckApp(QMainWindow):
         words_label.setFont(QFont("Helvetica", 11, QFont.Weight.Bold))
         words_layout.addWidget(words_label)
         
-        self.found_words_list = QListWidget()
-        self.found_words_list.setFont(QFont("Helvetica", 11))
-        self.found_words_list.setStyleSheet("""
-            QListWidget {
-                background-color: palette(base);
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-            }
-            QListWidget::item {
-                padding: 4px;
-            }
-            QListWidget::item:selected {
-                background-color: palette(highlight);
-                color: palette(highlighted-text);
-            }
-        """)
-        words_layout.addWidget(self.found_words_list)
+        self.found_words_text = QTextEdit()
+        self.found_words_text.setReadOnly(True)
+        self.found_words_text.setFont(QFont("Helvetica", 11))
+        words_layout.addWidget(self.found_words_text)
         
         self.btn_copy_words = QPushButton("📋 Копировать список")
         self.btn_copy_words.clicked.connect(self.copy_found_words)
@@ -636,7 +800,7 @@ class LemmaCheckApp(QMainWindow):
             self.doc_paths.clear()
             self.doc_list.clear()
             self.results_text.clear()
-            self.found_words_list.clear()
+            self.found_words_text.clear()
             self.update_status()
 
     def save_index(self):
@@ -685,7 +849,7 @@ class LemmaCheckApp(QMainWindow):
 
     def display_results(self, results: List[Tuple[str, float, str, List[int]]], query: str):
         self.results_text.clear()
-        self.found_words_list.clear()
+        self.found_words_text.clear()
         self.result_doc_ids = []
 
         if not results:
@@ -694,8 +858,8 @@ class LemmaCheckApp(QMainWindow):
 
         query_lemmas = set(lemma for _, lemma, _ in self.engine.lemmatize(query) if lemma)
         
-        # Collect all found words across all documents
-        all_found_words: Dict[str, int] = defaultdict(int)  # word -> count
+        # Collect found words per document
+        words_by_doc: Dict[str, Dict[str, int]] = {}  # filename -> {word: count}
         
         cursor = self.results_text.textCursor()
         
@@ -717,25 +881,42 @@ class LemmaCheckApp(QMainWindow):
 
         for doc_id, score, filename, positions in results:
             self.result_doc_ids.append(doc_id)
+            words_by_doc[filename] = defaultdict(int)
             
             cursor.insertText(f"📄 {filename}", title_fmt)
             cursor.insertText(f"  [релевантность: {score:.4f}]\n", score_fmt)
             
             context = self.engine.get_context(doc_id, positions)
             
-            # Highlight matches
+            # Highlight matches (including hyphenated words)
             last_end = 0
-            for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+', context):
+            for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', context):
                 word = match.group()
                 start = match.start()
                 
                 if start > last_end:
                     cursor.insertText(context[last_end:start], normal_fmt)
                 
-                lemma = self.engine._lemmatize_word(word)
-                if lemma in query_lemmas:
+                # Check if word or any part of hyphenated word matches
+                should_highlight = False
+                if '-' in word:
+                    # Check full compound and parts
+                    full_lemma = self.engine._lemmatize_compound(word)
+                    if full_lemma in query_lemmas:
+                        should_highlight = True
+                    else:
+                        for part in word.split('-'):
+                            if part and self.engine._lemmatize_word(part) in query_lemmas:
+                                should_highlight = True
+                                break
+                else:
+                    lemma = self.engine._lemmatize_word(word)
+                    if lemma in query_lemmas:
+                        should_highlight = True
+                
+                if should_highlight:
                     cursor.insertText(word, highlight_fmt)
-                    all_found_words[word.lower()] += 1
+                    words_by_doc[filename][word.lower()] += 1
                 else:
                     cursor.insertText(word, normal_fmt)
                 
@@ -748,12 +929,22 @@ class LemmaCheckApp(QMainWindow):
 
         cursor.insertText(f"Найдено результатов: {len(results)}", normal_fmt)
         
-        # Populate found words list
-        sorted_words = sorted(all_found_words.items(), key=lambda x: (-x[1], x[0]))
-        for word, count in sorted_words:
-            item = QListWidgetItem(f"{word} ({count})")
-            item.setData(Qt.ItemDataRole.UserRole, word)
-            self.found_words_list.addItem(item)
+        # Populate found words panel grouped by document
+        words_cursor = self.found_words_text.textCursor()
+        
+        doc_title_fmt = QTextCharFormat()
+        doc_title_fmt.setFontWeight(700)
+        doc_title_fmt.setForeground(QColor("#0066cc"))
+        
+        word_fmt = QTextCharFormat()
+        
+        for filename, words in words_by_doc.items():
+            if words:
+                words_cursor.insertText(f"📄 {filename}\n", doc_title_fmt)
+                sorted_words = sorted(words.items(), key=lambda x: (-x[1], x[0]))
+                for word, count in sorted_words:
+                    words_cursor.insertText(f"  • {word} ({count})\n", word_fmt)
+                words_cursor.insertText("\n", word_fmt)
 
     def open_file(self, filepath: str):
         try:
@@ -768,15 +959,13 @@ class LemmaCheckApp(QMainWindow):
 
     def copy_found_words(self):
         """Copy all found words to clipboard"""
-        words = []
-        for i in range(self.found_words_list.count()):
-            item = self.found_words_list.item(i)
-            words.append(item.text())
+        text = self.found_words_text.toPlainText()
         
-        if words:
+        if text.strip():
             clipboard = QApplication.clipboard()
-            clipboard.setText('\n'.join(words))
-            self.status_label.setText(f"Скопировано {len(words)} слов в буфер обмена")
+            clipboard.setText(text)
+            lines = [l for l in text.split('\n') if l.strip()]
+            self.status_label.setText(f"Скопировано {len(lines)} строк в буфер обмена")
 
 
 def main():

@@ -6,3 +6,4 @@ PyQt6
 chardet
 openpyxl
 xlrd
+pywin32; sys_platform == 'win32'

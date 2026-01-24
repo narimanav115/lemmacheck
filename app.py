@@ -351,19 +351,16 @@ class LemmaSearchEngine:
         idf = math.log(self.total_docs / df) + 1 if df > 0 and self.total_docs > 0 else 1
         return tf * idf
 
-    def search(self, query: str) -> List[Tuple[str, float, str, List[int]]]:
+    def search(self, query: str) -> List[Tuple[str, int, str, List[int]]]:
         if not query.strip():
             return []
-        
-        # Parse query for phrases (quoted or multi-word)
-        phrases = self._parse_phrases(query)
         
         query_words = self.lemmatize(query)
         query_lemmas = set(lemma for _, lemma, _ in query_words if lemma)
         if not query_lemmas:
             return []
         
-        doc_scores: Dict[str, float] = defaultdict(float)
+        doc_counts: Dict[str, int] = defaultdict(int)
         doc_positions: Dict[str, List[int]] = defaultdict(list)
         
         # Find documents containing ALL query lemmas (phrase search)
@@ -380,22 +377,16 @@ class LemmaSearchEngine:
         if not candidate_docs:
             return []
         
-        # Calculate TF-IDF for documents that have ALL terms
+        # Count total occurrences of query lemmas in documents
         for lemma in query_lemmas:
             if lemma in self.inverted_index:
                 for doc_id, positions in self.inverted_index[lemma].items():
                     if doc_id in candidate_docs:
-                        doc_scores[doc_id] += self._calculate_tfidf(lemma, doc_id)
+                        doc_counts[doc_id] += len(positions)
                         doc_positions[doc_id].extend(positions)
         
-        # Boost score for phrase matches (words appearing close together)
-        if len(phrases) > 0:
-            for doc_id in list(doc_scores.keys()):
-                phrase_boost = self._calculate_phrase_boost(doc_id, phrases)
-                doc_scores[doc_id] *= (1 + phrase_boost)
-        
-        results = [(doc_id, score, self.documents[doc_id]['filename'], sorted(set(doc_positions[doc_id])))
-                   for doc_id, score in doc_scores.items()]
+        results = [(doc_id, count, self.documents[doc_id]['filename'], sorted(set(doc_positions[doc_id])))
+                   for doc_id, count in doc_counts.items()]
         results.sort(key=lambda x: x[1], reverse=True)
         return results
 
@@ -847,7 +838,7 @@ class LemmaCheckApp(QMainWindow):
         results = self.engine.search(query)
         self.display_results(results, query)
 
-    def display_results(self, results: List[Tuple[str, float, str, List[int]]], query: str):
+    def display_results(self, results: List[Tuple[str, int, str, List[int]]], query: str):
         self.results_text.clear()
         self.found_words_text.clear()
         self.result_doc_ids = []
@@ -868,8 +859,8 @@ class LemmaCheckApp(QMainWindow):
         title_fmt.setFontWeight(700)
         title_fmt.setForeground(QColor("#0066cc"))
         
-        score_fmt = QTextCharFormat()
-        score_fmt.setForeground(QColor("#666666"))
+        count_fmt = QTextCharFormat()
+        count_fmt.setForeground(QColor("#666666"))
         
         # Soft highlight - light blue background, readable
         highlight_fmt = QTextCharFormat()
@@ -879,16 +870,39 @@ class LemmaCheckApp(QMainWindow):
         
         normal_fmt = QTextCharFormat()
 
-        for doc_id, score, filename, positions in results:
+        for doc_id, count, filename, positions in results:
             self.result_doc_ids.append(doc_id)
             words_by_doc[filename] = defaultdict(int)
             
+            # Count all matching words in the FULL document text
+            full_text = self.engine.documents[doc_id]['text']
+            total_count = 0
+            for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', full_text):
+                word = match.group()
+                should_count = False
+                if '-' in word:
+                    full_lemma = self.engine._lemmatize_compound(word)
+                    if full_lemma in query_lemmas:
+                        should_count = True
+                    else:
+                        for part in word.split('-'):
+                            if part and self.engine._lemmatize_word(part) in query_lemmas:
+                                should_count = True
+                                break
+                else:
+                    lemma = self.engine._lemmatize_word(word)
+                    if lemma in query_lemmas:
+                        should_count = True
+                if should_count:
+                    words_by_doc[filename][word.lower()] += 1
+                    total_count += 1
+            
             cursor.insertText(f"📄 {filename}", title_fmt)
-            cursor.insertText(f"  [релевантность: {score:.4f}]\n", score_fmt)
+            cursor.insertText(f"  [найдено: {total_count}]\n", count_fmt)
             
             context = self.engine.get_context(doc_id, positions)
             
-            # Highlight matches (including hyphenated words)
+            # Highlight matches in context (including hyphenated words)
             last_end = 0
             for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', context):
                 word = match.group()
@@ -916,7 +930,6 @@ class LemmaCheckApp(QMainWindow):
                 
                 if should_highlight:
                     cursor.insertText(word, highlight_fmt)
-                    words_by_doc[filename][word.lower()] += 1
                 else:
                     cursor.insertText(word, normal_fmt)
                 

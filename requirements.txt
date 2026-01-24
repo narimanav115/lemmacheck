@@ -2,3 +2,7 @@ pymorphy3
 nltk
 python-docx
 PyMuPDF
+PyQt6
+chardet
+openpyxl
+xlrd

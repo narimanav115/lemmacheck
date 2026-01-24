@@ -1,0 +1,4 @@
+pymorphy3
+nltk
+python-docx
+PyMuPDF

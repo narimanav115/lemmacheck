@@ -1019,8 +1019,9 @@ class LemmaCheckApp(QMainWindow):
         query_lemmas_set = set(query_lemmas)
         is_phrase_search = len(query_lemmas) > 1
         
-        # Collect found phrases/words per document
+        # Collect found phrases/words per document with word counts
         phrases_by_doc: Dict[str, List[str]] = {}  # filename -> list of found phrases
+        doc_word_counts: Dict[str, int] = {}  # filename -> total word count in doc
         
         cursor = self.results_text.textCursor()
         
@@ -1053,6 +1054,7 @@ class LemmaCheckApp(QMainWindow):
             
             self.result_doc_ids.append(doc_id)
             phrases_by_doc[filename] = []
+            doc_word_counts[filename] = self.engine.documents[doc_id]['word_count']
             
             full_text = self.engine.documents[doc_id]['text']
             
@@ -1129,10 +1131,20 @@ class LemmaCheckApp(QMainWindow):
         variation_fmt.setForeground(QColor("#7b1fa2"))  # Purple for variations count
         variation_fmt.setFontWeight(600)
         
+        percent_fmt = QTextCharFormat()
+        percent_fmt.setForeground(QColor("#e65100"))  # Orange for percentage
+        
+        ip10k_fmt = QTextCharFormat()
+        ip10k_fmt.setForeground(QColor("#00897b"))  # Teal for IP10K
+        
+        ipm_fmt = QTextCharFormat()
+        ipm_fmt.setForeground(QColor("#0277bd"))  # Blue for IPM
+        
         word_fmt = QTextCharFormat()
         
         grand_total = 0
         grand_variations = 0
+        total_words_all_docs = 0
         
         for filename, phrases in phrases_by_doc.items():
             if phrases:
@@ -1143,26 +1155,54 @@ class LemmaCheckApp(QMainWindow):
                 
                 doc_total = sum(phrase_counts.values())
                 doc_variations = len(phrase_counts)
+                doc_word_count = doc_word_counts.get(filename, 1)
+                doc_percent = (doc_total / doc_word_count * 100) if doc_word_count > 0 else 0
+                doc_iptт = (doc_total / doc_word_count * 10_000) if doc_word_count > 0 else 0  # per 10K
+                doc_ipm = (doc_total / doc_word_count * 1_000_000) if doc_word_count > 0 else 0  # per 1M
+                
                 grand_total += doc_total
                 grand_variations += doc_variations
+                total_words_all_docs += doc_word_count
                 
                 words_cursor.insertText(f"📄 {filename}\n", doc_title_fmt)
                 words_cursor.insertText(f"   Всего: {doc_total} | ", stats_fmt)
                 words_cursor.insertText(f"Вариаций: {doc_variations}\n", variation_fmt)
+                words_cursor.insertText(f"   Частота: {doc_percent:.2f}% | ", percent_fmt)
+                words_cursor.insertText(f"IP10K: {doc_iptт:.2f}", ip10k_fmt)
+                words_cursor.insertText(f" | ", stats_fmt)
+                words_cursor.insertText(f"IPM: {doc_ipm:.1f}\n", ipm_fmt)
                 
                 sorted_phrases = sorted(phrase_counts.items(), key=lambda x: (-x[1], x[0]))
                 for phrase, cnt in sorted_phrases:
-                    words_cursor.insertText(f"  • {phrase} ({cnt})\n", word_fmt)
+                    phrase_percent = (cnt / doc_word_count * 100) if doc_word_count > 0 else 0
+                    phrase_iptт = (cnt / doc_word_count * 10_000) if doc_word_count > 0 else 0
+                    phrase_ipm = (cnt / doc_word_count * 1_000_000) if doc_word_count > 0 else 0
+                    words_cursor.insertText(f"  • {phrase} ({cnt}) ", word_fmt)
+                    words_cursor.insertText(f"— {phrase_percent:.2f}% ", percent_fmt)
+                    words_cursor.insertText(f"[{phrase_iptт:.1f}", ip10k_fmt)
+                    words_cursor.insertText(f" | ", stats_fmt)
+                    words_cursor.insertText(f"{phrase_ipm:.0f}]\n", ipm_fmt)
                 words_cursor.insertText("\n", word_fmt)
+        
+        # Calculate grand total percentage, IP10K and IPM
+        grand_percent = (grand_total / total_words_all_docs * 100) if total_words_all_docs > 0 else 0
+        grand_iptт = (grand_total / total_words_all_docs * 10_000) if total_words_all_docs > 0 else 0
+        grand_ipm = (grand_total / total_words_all_docs * 1_000_000) if total_words_all_docs > 0 else 0
         
         # Add grand total
         words_cursor.insertText("═" * 25 + "\n", word_fmt)
         words_cursor.insertText(f"📊 ИТОГО\n", total_fmt)
-        words_cursor.insertText(f"   Совпадений: {grand_total}\n", stats_fmt)
+        words_cursor.insertText(f"   Совпадений: {grand_total} ", stats_fmt)
+        words_cursor.insertText(f"({grand_percent:.2f}%)\n", percent_fmt)
+        words_cursor.insertText(f"   IP10K: ", stats_fmt)
+        words_cursor.insertText(f"{grand_iptт:.2f}\n", ip10k_fmt)
+        words_cursor.insertText(f"   IPM: ", stats_fmt)
+        words_cursor.insertText(f"{grand_ipm:.1f}\n", ipm_fmt)
         words_cursor.insertText(f"   Вариаций: {grand_variations}\n", variation_fmt)
-        words_cursor.insertText(f"   Документов: {len(results)}", stats_fmt)
+        words_cursor.insertText(f"   Документов: {len(results)}\n", stats_fmt)
+        words_cursor.insertText(f"   Слов всего: {total_words_all_docs:,}".replace(',', ' '), stats_fmt)
         
-        self.status_label.setText(f"Найдено {grand_total} совпадений ({grand_variations} вариаций) в {len(results)} документах")
+        self.status_label.setText(f"Найдено {grand_total} совпадений ({grand_percent:.2f}%, IP10K: {grand_iptт:.1f}) в {len(results)} документах")
 
     def _extract_phrase_at_position(self, text: str, start_pos: int, word_count: int) -> str:
         """Extract a phrase starting at given position with given number of words"""

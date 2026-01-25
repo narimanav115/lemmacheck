@@ -352,43 +352,97 @@ class LemmaSearchEngine:
         return tf * idf
 
     def search(self, query: str) -> List[Tuple[str, int, str, List[int]]]:
+        """Search for exact phrase (words in sequence) in documents"""
         if not query.strip():
             return []
         
         query_words = self.lemmatize(query)
-        query_lemmas = set(lemma for _, lemma, _ in query_words if lemma)
+        query_lemmas = [lemma for _, lemma, _ in query_words if lemma]
         if not query_lemmas:
             return []
         
-        doc_counts: Dict[str, int] = defaultdict(int)
-        doc_positions: Dict[str, List[int]] = defaultdict(list)
+        query_lemmas_set = set(query_lemmas)
         
-        # Find documents containing ALL query lemmas (phrase search)
-        # First, find candidate documents that have at least one lemma
+        # Find candidate documents that have ALL query lemmas
         candidate_docs: Set[str] = set()
-        for lemma in query_lemmas:
+        for lemma in query_lemmas_set:
             if lemma in self.inverted_index:
                 if not candidate_docs:
                     candidate_docs = set(self.inverted_index[lemma].keys())
                 else:
-                    # Intersect to keep only docs with ALL lemmas
                     candidate_docs &= set(self.inverted_index[lemma].keys())
         
         if not candidate_docs:
             return []
         
-        # Count total occurrences of query lemmas in documents
-        for lemma in query_lemmas:
-            if lemma in self.inverted_index:
-                for doc_id, positions in self.inverted_index[lemma].items():
-                    if doc_id in candidate_docs:
-                        doc_counts[doc_id] += len(positions)
-                        doc_positions[doc_id].extend(positions)
+        results = []
         
-        results = [(doc_id, count, self.documents[doc_id]['filename'], sorted(set(doc_positions[doc_id])))
-                   for doc_id, count in doc_counts.items()]
+        # For single word queries, just count occurrences
+        if len(query_lemmas) == 1:
+            lemma = query_lemmas[0]
+            for doc_id in candidate_docs:
+                positions = self.inverted_index[lemma][doc_id]
+                count = len(positions)
+                results.append((doc_id, count, self.documents[doc_id]['filename'], positions))
+        else:
+            # For multi-word queries, find exact phrase matches
+            for doc_id in candidate_docs:
+                phrase_positions = self._find_phrase_in_document(doc_id, query_lemmas)
+                if phrase_positions:
+                    count = len(phrase_positions)
+                    results.append((doc_id, count, self.documents[doc_id]['filename'], phrase_positions))
+        
         results.sort(key=lambda x: x[1], reverse=True)
         return results
+
+    def _find_phrase_in_document(self, doc_id: str, query_lemmas: List[str], max_distance: int = 15) -> List[int]:
+        """Find all occurrences of a phrase in a document.
+        Returns list of starting positions where the phrase was found.
+        max_distance is the maximum character distance between consecutive words."""
+        if doc_id not in self.documents:
+            return []
+        
+        # Get positions for each lemma in the query
+        lemma_positions = []
+        for lemma in query_lemmas:
+            if lemma in self.inverted_index and doc_id in self.inverted_index[lemma]:
+                lemma_positions.append(sorted(self.inverted_index[lemma][doc_id]))
+            else:
+                return []  # If any lemma is missing, no phrase match possible
+        
+        if not lemma_positions or not lemma_positions[0]:
+            return []
+        
+        phrase_starts = []
+        first_positions = lemma_positions[0]
+        
+        for start_pos in first_positions:
+            current_pos = start_pos
+            matched = True
+            
+            for i in range(1, len(lemma_positions)):
+                next_positions = lemma_positions[i]
+                found_next = False
+                
+                # Find the next lemma position that comes after current_pos within max_distance
+                for pos in next_positions:
+                    if current_pos < pos <= current_pos + max_distance:
+                        current_pos = pos
+                        found_next = True
+                        break
+                
+                if not found_next:
+                    matched = False
+                    break
+            
+            if matched:
+                phrase_starts.append(start_pos)
+        
+        return phrase_starts
+
+    def get_query_lemmas(self, query: str) -> List[str]:
+        """Get ordered list of lemmas from query"""
+        return [lemma for _, lemma, _ in self.lemmatize(query) if lemma]
 
     def _parse_phrases(self, query: str) -> List[List[str]]:
         """Parse query into phrases (multi-word sequences)"""
@@ -507,6 +561,77 @@ class LemmaSearchEngine:
                 used_ranges.append((start, end))
         return " | ".join(contexts)
 
+    def get_sentences_with_matches(self, doc_id: str, positions: List[int]) -> List[Tuple[int, str]]:
+        """Get sentences containing matches with 1 sentence before and after.
+        Returns list of (match_number, context_text) tuples."""
+        if doc_id not in self.documents:
+            return []
+        
+        text = self.documents[doc_id]['text']
+        if not positions:
+            return []
+        
+        # Split text into sentences
+        # Pattern matches sentence endings: . ! ? followed by space or newline
+        sentence_pattern = r'[^.!?]*[.!?]+(?:\s|$)|[^.!?\n]+$'
+        sentences = []
+        for match in re.finditer(sentence_pattern, text):
+            sent_text = match.group().strip()
+            if sent_text:
+                sentences.append((match.start(), match.end(), sent_text))
+        
+        if not sentences:
+            return [(1, text[:500] + "..." if len(text) > 500 else text)]
+        
+        # Find which sentences contain matches
+        matched_contexts = []
+        used_positions = set()
+        
+        for match_idx, pos in enumerate(positions):
+            if pos in used_positions:
+                continue
+                
+            # Find sentence containing this position
+            sent_idx = None
+            for idx, (start, end, sent_text) in enumerate(sentences):
+                if start <= pos < end:
+                    sent_idx = idx
+                    break
+            
+            if sent_idx is None:
+                continue
+            
+            # Mark this position as used
+            used_positions.add(pos)
+            
+            # Get 1 sentence before, the match sentence, and 1 sentence after
+            context_parts = []
+            
+            # Previous sentence
+            if sent_idx > 0:
+                context_parts.append(sentences[sent_idx - 1][2])
+            
+            # Current sentence (with match)
+            context_parts.append(sentences[sent_idx][2])
+            
+            # Next sentence
+            if sent_idx < len(sentences) - 1:
+                context_parts.append(sentences[sent_idx + 1][2])
+            
+            context = ' '.join(context_parts)
+            
+            # Check if this context overlaps with already added ones
+            is_duplicate = False
+            for _, existing_context in matched_contexts:
+                if sentences[sent_idx][2] in existing_context:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                matched_contexts.append((match_idx + 1, context))
+        
+        return matched_contexts
+
     def save_index(self, filepath: str):
         data = {
             'documents': self.documents,
@@ -563,6 +688,27 @@ class IndexingThread(QThread):
         self.done.emit()
 
 
+# ==================== Search Thread ====================
+
+class SearchThread(QThread):
+    """Thread for performing search and collecting results"""
+    progress = pyqtSignal(str)
+    result_ready = pyqtSignal(object, str)  # (results, query)
+    done = pyqtSignal()
+
+    def __init__(self, engine: LemmaSearchEngine, query: str):
+        super().__init__()
+        self.engine = engine
+        self.query = query
+        self.results = []
+
+    def run(self):
+        self.progress.emit("Поиск совпадений...")
+        self.results = self.engine.search(self.query)
+        self.result_ready.emit(self.results, self.query)
+        self.done.emit()
+
+
 # ==================== Main Window ====================
 
 class LemmaCheckApp(QMainWindow):
@@ -572,6 +718,7 @@ class LemmaCheckApp(QMainWindow):
         self.doc_paths: Dict[str, str] = {}
         self.result_doc_ids: List[str] = []
         self.indexing_thread: Optional[IndexingThread] = None
+        self.search_thread: Optional[SearchThread] = None
         self.init_ui()
 
     def init_ui(self):
@@ -835,8 +982,29 @@ class LemmaCheckApp(QMainWindow):
         if not self.engine.documents:
             QMessageBox.information(self, "Информация", "Сначала добавьте документы.")
             return
-        results = self.engine.search(query)
+        
+        # Show loading state
+        self.results_text.clear()
+        self.found_words_text.clear()
+        self.results_text.setPlainText("⏳ Поиск...")
+        self.btn_search.setEnabled(False)
+        self.status_label.setText("Выполняется поиск...")
+        QApplication.processEvents()
+        
+        # Run search in thread
+        self.search_thread = SearchThread(self.engine, query)
+        self.search_thread.result_ready.connect(self.on_search_results)
+        self.search_thread.start()
+
+    def on_search_results(self, results, query):
+        """Handle search results from thread"""
+        self.btn_search.setEnabled(True)
+        self.results_text.clear()
+        self.results_text.setPlainText("⏳ Обработка результатов...")
+        QApplication.processEvents()
+        
         self.display_results(results, query)
+        self.update_status()
 
     def display_results(self, results: List[Tuple[str, int, str, List[int]]], query: str):
         self.results_text.clear()
@@ -847,10 +1015,12 @@ class LemmaCheckApp(QMainWindow):
             self.results_text.setPlainText("Ничего не найдено.")
             return
 
-        query_lemmas = set(lemma for _, lemma, _ in self.engine.lemmatize(query) if lemma)
+        query_lemmas = self.engine.get_query_lemmas(query)
+        query_lemmas_set = set(query_lemmas)
+        is_phrase_search = len(query_lemmas) > 1
         
-        # Collect found words per document
-        words_by_doc: Dict[str, Dict[str, int]] = {}  # filename -> {word: count}
+        # Collect found phrases/words per document
+        phrases_by_doc: Dict[str, List[str]] = {}  # filename -> list of found phrases
         
         cursor = self.results_text.textCursor()
         
@@ -862,6 +1032,10 @@ class LemmaCheckApp(QMainWindow):
         count_fmt = QTextCharFormat()
         count_fmt.setForeground(QColor("#666666"))
         
+        para_num_fmt = QTextCharFormat()
+        para_num_fmt.setForeground(QColor("#888888"))
+        para_num_fmt.setFontWeight(600)
+        
         # Soft highlight - light blue background, readable
         highlight_fmt = QTextCharFormat()
         highlight_fmt.setBackground(QColor("#b3e5fc"))  # Light blue
@@ -869,95 +1043,176 @@ class LemmaCheckApp(QMainWindow):
         highlight_fmt.setFontWeight(600)
         
         normal_fmt = QTextCharFormat()
+        
+        total_results = len(results)
 
-        for doc_id, count, filename, positions in results:
-            self.result_doc_ids.append(doc_id)
-            words_by_doc[filename] = defaultdict(int)
+        for idx, (doc_id, count, filename, positions) in enumerate(results):
+            # Update progress
+            self.status_label.setText(f"Обработка документа {idx + 1} из {total_results}...")
+            QApplication.processEvents()
             
-            # Count all matching words in the FULL document text
+            self.result_doc_ids.append(doc_id)
+            phrases_by_doc[filename] = []
+            
             full_text = self.engine.documents[doc_id]['text']
-            total_count = 0
-            for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', full_text):
-                word = match.group()
-                should_count = False
-                if '-' in word:
-                    full_lemma = self.engine._lemmatize_compound(word)
-                    if full_lemma in query_lemmas:
-                        should_count = True
-                    else:
-                        for part in word.split('-'):
-                            if part and self.engine._lemmatize_word(part) in query_lemmas:
-                                should_count = True
-                                break
-                else:
+            
+            if is_phrase_search:
+                # For phrase search, extract the actual phrases found
+                for pos in positions:
+                    phrase = self._extract_phrase_at_position(full_text, pos, len(query_lemmas))
+                    if phrase:
+                        phrases_by_doc[filename].append(phrase)
+                total_count = count  # count already contains phrase matches
+            else:
+                # For single word search, count all occurrences
+                total_count = 0
+                for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', full_text):
+                    word = match.group()
                     lemma = self.engine._lemmatize_word(word)
-                    if lemma in query_lemmas:
-                        should_count = True
-                if should_count:
-                    words_by_doc[filename][word.lower()] += 1
-                    total_count += 1
+                    if lemma in query_lemmas_set:
+                        phrases_by_doc[filename].append(word.lower())
+                        total_count += 1
             
             cursor.insertText(f"📄 {filename}", title_fmt)
-            cursor.insertText(f"  [найдено: {total_count}]\n", count_fmt)
+            cursor.insertText(f"  [найдено: {total_count}]\n\n", count_fmt)
             
-            context = self.engine.get_context(doc_id, positions)
+            # Get sentences with matches (1 before, match, 1 after)
+            sentence_contexts = self.engine.get_sentences_with_matches(doc_id, positions)
             
-            # Highlight matches in context (including hyphenated words)
-            last_end = 0
-            for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', context):
-                word = match.group()
-                start = match.start()
+            for match_num, context_text in sentence_contexts:
+                cursor.insertText(f"[{match_num}] ", para_num_fmt)
                 
-                if start > last_end:
-                    cursor.insertText(context[last_end:start], normal_fmt)
-                
-                # Check if word or any part of hyphenated word matches
-                should_highlight = False
-                if '-' in word:
-                    # Check full compound and parts
-                    full_lemma = self.engine._lemmatize_compound(word)
-                    if full_lemma in query_lemmas:
-                        should_highlight = True
-                    else:
-                        for part in word.split('-'):
-                            if part and self.engine._lemmatize_word(part) in query_lemmas:
-                                should_highlight = True
-                                break
+                # Highlight matches in context
+                if is_phrase_search:
+                    self._highlight_phrases_in_context(cursor, context_text, query_lemmas, highlight_fmt, normal_fmt)
                 else:
-                    lemma = self.engine._lemmatize_word(word)
-                    if lemma in query_lemmas:
-                        should_highlight = True
+                    last_end = 0
+                    for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', context_text):
+                        word = match.group()
+                        start = match.start()
+                        
+                        if start > last_end:
+                            cursor.insertText(context_text[last_end:start], normal_fmt)
+                        
+                        lemma = self.engine._lemmatize_word(word)
+                        if lemma in query_lemmas_set:
+                            cursor.insertText(word, highlight_fmt)
+                        else:
+                            cursor.insertText(word, normal_fmt)
+                        
+                        last_end = match.end()
+                    
+                    if last_end < len(context_text):
+                        cursor.insertText(context_text[last_end:], normal_fmt)
                 
-                if should_highlight:
-                    cursor.insertText(word, highlight_fmt)
-                else:
-                    cursor.insertText(word, normal_fmt)
-                
-                last_end = match.end()
+                cursor.insertText("\n\n", normal_fmt)
             
-            if last_end < len(context):
-                cursor.insertText(context[last_end:], normal_fmt)
-            
-            cursor.insertText("\n\n" + "─" * 70 + "\n\n", normal_fmt)
+            cursor.insertText("─" * 70 + "\n\n", normal_fmt)
 
-        cursor.insertText(f"Найдено результатов: {len(results)}", normal_fmt)
+        cursor.insertText(f"Найдено документов: {len(results)}", normal_fmt)
         
-        # Populate found words panel grouped by document
+        # Populate found phrases panel grouped by document
         words_cursor = self.found_words_text.textCursor()
         
         doc_title_fmt = QTextCharFormat()
         doc_title_fmt.setFontWeight(700)
         doc_title_fmt.setForeground(QColor("#0066cc"))
         
+        total_fmt = QTextCharFormat()
+        total_fmt.setFontWeight(700)
+        total_fmt.setForeground(QColor("#2e7d32"))
+        
+        stats_fmt = QTextCharFormat()
+        stats_fmt.setForeground(QColor("#555555"))
+        
+        variation_fmt = QTextCharFormat()
+        variation_fmt.setForeground(QColor("#7b1fa2"))  # Purple for variations count
+        variation_fmt.setFontWeight(600)
+        
         word_fmt = QTextCharFormat()
         
-        for filename, words in words_by_doc.items():
-            if words:
+        grand_total = 0
+        grand_variations = 0
+        
+        for filename, phrases in phrases_by_doc.items():
+            if phrases:
+                # Count unique phrases
+                phrase_counts = defaultdict(int)
+                for phrase in phrases:
+                    phrase_counts[phrase.lower()] += 1
+                
+                doc_total = sum(phrase_counts.values())
+                doc_variations = len(phrase_counts)
+                grand_total += doc_total
+                grand_variations += doc_variations
+                
                 words_cursor.insertText(f"📄 {filename}\n", doc_title_fmt)
-                sorted_words = sorted(words.items(), key=lambda x: (-x[1], x[0]))
-                for word, count in sorted_words:
-                    words_cursor.insertText(f"  • {word} ({count})\n", word_fmt)
+                words_cursor.insertText(f"   Всего: {doc_total} | ", stats_fmt)
+                words_cursor.insertText(f"Вариаций: {doc_variations}\n", variation_fmt)
+                
+                sorted_phrases = sorted(phrase_counts.items(), key=lambda x: (-x[1], x[0]))
+                for phrase, cnt in sorted_phrases:
+                    words_cursor.insertText(f"  • {phrase} ({cnt})\n", word_fmt)
                 words_cursor.insertText("\n", word_fmt)
+        
+        # Add grand total
+        words_cursor.insertText("═" * 25 + "\n", word_fmt)
+        words_cursor.insertText(f"📊 ИТОГО\n", total_fmt)
+        words_cursor.insertText(f"   Совпадений: {grand_total}\n", stats_fmt)
+        words_cursor.insertText(f"   Вариаций: {grand_variations}\n", variation_fmt)
+        words_cursor.insertText(f"   Документов: {len(results)}", stats_fmt)
+        
+        self.status_label.setText(f"Найдено {grand_total} совпадений ({grand_variations} вариаций) в {len(results)} документах")
+
+    def _extract_phrase_at_position(self, text: str, start_pos: int, word_count: int) -> str:
+        """Extract a phrase starting at given position with given number of words"""
+        words = []
+        for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', text[start_pos:]):
+            words.append(match.group())
+            if len(words) >= word_count:
+                break
+        return ' '.join(words) if len(words) == word_count else ''
+
+    def _highlight_phrases_in_context(self, cursor, context: str, query_lemmas: List[str], 
+                                       highlight_fmt, normal_fmt):
+        """Highlight phrase matches in context text"""
+        # Find all word positions in context
+        word_matches = list(re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', context))
+        
+        if not word_matches:
+            cursor.insertText(context, normal_fmt)
+            return
+        
+        # Find phrase matches (sequences of words matching query lemmas)
+        highlight_ranges = []
+        i = 0
+        while i <= len(word_matches) - len(query_lemmas):
+            matched = True
+            for j, query_lemma in enumerate(query_lemmas):
+                word = word_matches[i + j].group()
+                word_lemma = self.engine._lemmatize_word(word)
+                if word_lemma != query_lemma:
+                    matched = False
+                    break
+            
+            if matched:
+                start = word_matches[i].start()
+                end = word_matches[i + len(query_lemmas) - 1].end()
+                highlight_ranges.append((start, end))
+                i += len(query_lemmas)  # Skip past matched phrase
+            else:
+                i += 1
+        
+        # Output text with highlights
+        last_end = 0
+        for start, end in highlight_ranges:
+            if start > last_end:
+                cursor.insertText(context[last_end:start], normal_fmt)
+            cursor.insertText(context[start:end], highlight_fmt)
+            last_end = end
+        
+        if last_end < len(context):
+            cursor.insertText(context[last_end:], normal_fmt)
 
     def open_file(self, filepath: str):
         try:

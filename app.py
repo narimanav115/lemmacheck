@@ -10,9 +10,11 @@ import sys
 import os
 import re
 import json
+import csv
 import math
 import subprocess
 import platform
+from datetime import datetime
 from collections import defaultdict
 from typing import Dict, List, Tuple, Set, Optional
 from pathlib import Path
@@ -21,10 +23,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QListWidget, QTextEdit, QLabel,
     QFileDialog, QMessageBox, QProgressBar, QGroupBox, QSplitter,
-    QAbstractItemView, QListWidgetItem, QFrame, QCheckBox
+    QAbstractItemView, QListWidgetItem, QFrame, QCheckBox,
+    QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QTabWidget, QDialog, QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QTextCharFormat, QColor, QTextCursor, QBrush
+from PyQt6.QtGui import QFont, QTextCharFormat, QColor, QTextCursor, QBrush, QPalette
 
 import chardet
 
@@ -723,6 +727,81 @@ class LemmaSearchEngine:
         
         return matched_contexts
 
+    def get_kwic_concordance(self, doc_id: str, positions: List[int],
+                              query_lemmas: List[str], context_words: int = 5,
+                              context_type: str = 'words') -> List[Tuple[str, str, str, str, int]]:
+        """Build KWIC concordance lines for a document.
+        Returns list of (filename, left_context, keyword, right_context) tuples."""
+        if doc_id not in self.documents:
+            return []
+        text = self.documents[doc_id]['text']
+        filename = self.documents[doc_id]['filename']
+        query_len = len(query_lemmas)
+        results: List[Tuple[str, str, str, str, int]] = []
+
+        # Build a word list with positions
+        word_matches = list(re.finditer(WORD_PATTERN, text))
+        if not word_matches:
+            return []
+
+        # Map char positions to word indices for fast lookup
+        pos_to_widx: Dict[int, int] = {m.start(): i for i, m in enumerate(word_matches)}
+
+        for pos in positions:
+            # Find the word index closest to this char position
+            widx = pos_to_widx.get(pos)
+            if widx is None:
+                # Find nearest
+                best = None
+                for start, idx in pos_to_widx.items():
+                    if best is None or abs(start - pos) < abs(best - pos):
+                        best = start
+                if best is not None:
+                    widx = pos_to_widx[best]
+                else:
+                    continue
+
+            if context_type == 'sentence':
+                # Sentence-based context
+                kw_start = word_matches[widx].start()
+                kw_end_idx = min(widx + query_len - 1, len(word_matches) - 1)
+                kw_end = word_matches[kw_end_idx].end()
+                keyword = text[kw_start:kw_end]
+
+                # Find sentence boundaries
+                sent_pattern = r'[^.!?]*[.!?]+(?:\s|$)|[^.!?\n]+$'
+                sentences = [(m.start(), m.end()) for m in re.finditer(sent_pattern, text)]
+                sent_start = 0
+                sent_end = len(text)
+                for s_start, s_end in sentences:
+                    if s_start <= kw_start < s_end:
+                        sent_start = s_start
+                        sent_end = s_end
+                        break
+
+                left = text[sent_start:kw_start].strip()
+                right = text[kw_end:sent_end].strip()
+            else:
+                # Word-based context (±N words)
+                kw_end_idx = min(widx + query_len - 1, len(word_matches) - 1)
+                keyword = text[word_matches[widx].start():word_matches[kw_end_idx].end()]
+
+                left_start_idx = max(0, widx - context_words)
+                right_end_idx = min(len(word_matches) - 1, kw_end_idx + context_words)
+
+                if left_start_idx < widx:
+                    left = text[word_matches[left_start_idx].start():word_matches[widx].start()].strip()
+                else:
+                    left = ''
+                if kw_end_idx < right_end_idx:
+                    right = text[word_matches[kw_end_idx].end():word_matches[right_end_idx].end()].strip()
+                else:
+                    right = ''
+
+            results.append((filename, left, keyword, right, pos))
+
+        return results
+
     def save_index(self, filepath: str):
         data = {
             'documents': self.documents,
@@ -784,22 +863,190 @@ class IndexingThread(QThread):
 # ==================== Search Thread ====================
 
 class SearchThread(QThread):
-    """Thread for performing search and collecting results"""
+    """Thread for performing search and collecting results, optionally KWIC concordance."""
     progress = pyqtSignal(str)
     result_ready = pyqtSignal(object, str)  # (results, query)
+    kwic_ready = pyqtSignal(object)  # kwic_rows list
     done = pyqtSignal()
 
-    def __init__(self, engine: LemmaSearchEngine, query: str):
+    def __init__(self, engine: LemmaSearchEngine, query: str,
+                 kwic_enabled: bool = False, kwic_context_type: str = 'words',
+                 kwic_context_words: int = 5, kwic_filter: str = ''):
         super().__init__()
         self.engine = engine
         self.query = query
+        self.kwic_enabled = kwic_enabled
+        self.kwic_context_type = kwic_context_type
+        self.kwic_context_words = kwic_context_words
+        self.kwic_filter = kwic_filter
         self.results = []
 
     def run(self):
         self.progress.emit("Поиск совпадений...")
         self.results = self.engine.search(self.query)
         self.result_ready.emit(self.results, self.query)
+
+        if self.kwic_enabled and self.results:
+            self.progress.emit("Построение KWIC-конкорданса...")
+            query_lemmas = self.engine.get_query_lemmas(self.query)
+            all_rows: list = []
+            for doc_id, count, filename, positions in self.results:
+                rows = self.engine.get_kwic_concordance(
+                    doc_id, positions, query_lemmas,
+                    self.kwic_context_words, self.kwic_context_type
+                )
+                all_rows.extend(rows)
+
+            # Apply context filter
+            if self.kwic_filter:
+                filter_lower = self.kwic_filter.lower()
+                filter_lemma = self.engine._lemmatize_word(self.kwic_filter)
+                filtered: list = []
+                for row in all_rows:
+                    fname, left, kw, right, pos = row
+                    combined = f"{left} {right}".lower()
+                    if filter_lower in combined:
+                        filtered.append(row)
+                        continue
+                    context_words_list = re.findall(WORD_PATTERN, combined)
+                    context_lemmas = [self.engine._lemmatize_word(w) for w in context_words_list]
+                    if filter_lemma in context_lemmas:
+                        filtered.append(row)
+                all_rows = filtered
+
+            self.kwic_ready.emit(all_rows)
+
         self.done.emit()
+
+
+# ==================== Export Dialog ====================
+
+class ExportDialog(QDialog):
+    """Dialog for choosing export type and format."""
+
+    def __init__(self, parent=None, has_kwic: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle("Экспорт данных")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        # Export type
+        type_group = QGroupBox("Тип экспорта")
+        type_layout = QVBoxLayout(type_group)
+
+        self.type_button_group = QButtonGroup(self)
+        self.radio_results = QRadioButton("Таблица результатов (частоты, IP10K, IPM, TF-IDF)")
+        self.radio_concordance = QRadioButton("Конкорданс (KWIC-таблица)")
+        self.radio_summary = QRadioButton("Сводный отчёт")
+
+        self.radio_results.setChecked(True)
+        self.radio_concordance.setEnabled(has_kwic)
+        if not has_kwic:
+            self.radio_concordance.setToolTip("Сначала включите KWIC и выполните поиск")
+
+        self.type_button_group.addButton(self.radio_results, 0)
+        self.type_button_group.addButton(self.radio_concordance, 1)
+        self.type_button_group.addButton(self.radio_summary, 2)
+
+        type_layout.addWidget(self.radio_results)
+        type_layout.addWidget(self.radio_concordance)
+        type_layout.addWidget(self.radio_summary)
+        layout.addWidget(type_group)
+
+        # Format
+        format_group = QGroupBox("Формат файла")
+        format_layout = QHBoxLayout(format_group)
+
+        self.format_button_group = QButtonGroup(self)
+        self.radio_csv = QRadioButton("CSV")
+        self.radio_xlsx = QRadioButton("XLSX")
+        self.radio_csv.setChecked(True)
+
+        if openpyxl is None:
+            self.radio_xlsx.setEnabled(False)
+            self.radio_xlsx.setToolTip("openpyxl не установлен (pip install openpyxl)")
+
+        self.format_button_group.addButton(self.radio_csv, 0)
+        self.format_button_group.addButton(self.radio_xlsx, 1)
+
+        format_layout.addWidget(self.radio_csv)
+        format_layout.addWidget(self.radio_xlsx)
+        layout.addWidget(format_group)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_save = QPushButton("Сохранить")
+        btn_save.setStyleSheet("background-color: #ec407a; color: white;")
+        btn_save.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_save)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def get_export_type(self) -> int:
+        """0 = results table, 1 = concordance, 2 = summary"""
+        return self.type_button_group.checkedId()
+
+    def get_format(self) -> str:
+        """'csv' or 'xlsx'"""
+        return 'xlsx' if self.format_button_group.checkedId() == 1 else 'csv'
+
+
+# ==================== Export Thread ====================
+
+class ExportThread(QThread):
+    """Thread for exporting data to CSV or XLSX."""
+    progress = pyqtSignal(str)
+    done = pyqtSignal(str)   # filepath
+    error = pyqtSignal(str)
+
+    def __init__(self, filepath: str, fmt: str, headers: List[str], rows: List[list]):
+        super().__init__()
+        self.filepath = filepath
+        self.fmt = fmt
+        self.headers = headers
+        self.rows = rows
+
+    def run(self):
+        try:
+            self.progress.emit("Экспорт данных...")
+            if self.fmt == 'csv':
+                with open(self.filepath, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(self.headers)
+                    writer.writerows(self.rows)
+            elif self.fmt == 'xlsx':
+                if openpyxl is None:
+                    self.error.emit("openpyxl не установлен")
+                    return
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "LemmaCheck Export"
+                # Header row with bold font
+                from openpyxl.styles import Font as XlFont
+                bold = XlFont(bold=True)
+                for col_idx, header in enumerate(self.headers, 1):
+                    cell = ws.cell(row=1, column=col_idx, value=header)
+                    cell.font = bold
+                # Data rows
+                for row_idx, row in enumerate(self.rows, 2):
+                    for col_idx, value in enumerate(row, 1):
+                        ws.cell(row=row_idx, column=col_idx, value=value)
+                # Auto-width columns
+                for col_idx, header in enumerate(self.headers, 1):
+                    max_len = len(str(header))
+                    for row in self.rows[:200]:
+                        if col_idx - 1 < len(row):
+                            max_len = max(max_len, len(str(row[col_idx - 1])))
+                    col_letter = openpyxl.utils.get_column_letter(col_idx)
+                    ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
+                wb.save(self.filepath)
+            self.done.emit(self.filepath)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ==================== Main Window ====================
@@ -812,6 +1059,11 @@ class LemmaCheckApp(QMainWindow):
         self.result_doc_ids: List[str] = []
         self.indexing_thread: Optional[IndexingThread] = None
         self.search_thread: Optional[SearchThread] = None
+        self.export_thread: Optional[ExportThread] = None
+        # Stored data for export
+        self.last_results: List[Tuple[str, int, str, List[int]]] = []
+        self.last_query: str = ''
+        self.last_kwic_data: List[Tuple[str, str, str, str, int]] = []
         self.init_ui()
 
     def init_ui(self):
@@ -839,24 +1091,24 @@ class LemmaCheckApp(QMainWindow):
         btn_layout.addWidget(self.btn_add_folder)
 
         self.btn_remove = QPushButton("Удалить")
-        self.btn_remove.setStyleSheet("background-color: #d9534f; color: white;")
+        self.btn_remove.setStyleSheet("background-color: #e91e63; color: white;")
         self.btn_remove.clicked.connect(self.remove_selected)
         btn_layout.addWidget(self.btn_remove)
 
         self.btn_clear = QPushButton("Очистить")
-        self.btn_clear.setStyleSheet("background-color: #d9534f; color: white;")
+        self.btn_clear.setStyleSheet("background-color: #e91e63; color: white;")
         self.btn_clear.clicked.connect(self.clear_all)
         btn_layout.addWidget(self.btn_clear)
 
         btn_layout.addStretch()
 
         self.btn_save = QPushButton("Сохранить индекс")
-        self.btn_save.setStyleSheet("background-color: #5cb85c; color: white;")
+        self.btn_save.setStyleSheet("background-color: #ab47bc; color: white;")
         self.btn_save.clicked.connect(self.save_index)
         btn_layout.addWidget(self.btn_save)
 
         self.btn_load = QPushButton("Загрузить индекс")
-        self.btn_load.setStyleSheet("background-color: #5cb85c; color: white;")
+        self.btn_load.setStyleSheet("background-color: #ab47bc; color: white;")
         self.btn_load.clicked.connect(self.load_index)
         btn_layout.addWidget(self.btn_load)
 
@@ -894,7 +1146,7 @@ class LemmaCheckApp(QMainWindow):
         search_layout.addWidget(self.search_input)
 
         self.btn_search = QPushButton("Искать")
-        self.btn_search.setStyleSheet("background-color: #337ab7; color: white;")
+        self.btn_search.setStyleSheet("background-color: #ec407a; color: white; font-size: 14px;")
         self.btn_search.clicked.connect(self.search)
         search_layout.addWidget(self.btn_search)
 
@@ -908,14 +1160,78 @@ class LemmaCheckApp(QMainWindow):
 
         layout.addWidget(search_group)
 
+        # === KWIC & Export Section ===
+        kwic_group = QGroupBox("📊 KWIC-конкорданс и экспорт")
+        kwic_layout = QHBoxLayout(kwic_group)
+
+        self.kwic_checkbox = QCheckBox("Включить KWIC")
+        self.kwic_checkbox.setToolTip("Показать результаты в виде KWIC-таблицы (Key Word In Context)")
+        kwic_layout.addWidget(self.kwic_checkbox)
+
+        kwic_layout.addWidget(QLabel("Контекст:"))
+        self.kwic_context_type = QComboBox()
+        self.kwic_context_type.addItems(["±5 слов", "±10 слов", "Предложение"])
+        self.kwic_context_type.setToolTip("Тип контекстного окна")
+        kwic_layout.addWidget(self.kwic_context_type)
+
+        kwic_layout.addWidget(QLabel("Фильтр:"))
+        self.kwic_filter_input = QLineEdit()
+        self.kwic_filter_input.setPlaceholderText("Слово в контексте...")
+        self.kwic_filter_input.setMaximumWidth(160)
+        self.kwic_filter_input.setToolTip(
+            "Показать только строки, где в контексте (левом или правом) встречается это слово"
+        )
+        kwic_layout.addWidget(self.kwic_filter_input)
+
+        kwic_layout.addStretch()
+
+        self.btn_export = QPushButton("📥 Экспорт")
+        self.btn_export.setStyleSheet("background-color: #ab47bc; color: white;")
+        self.btn_export.setToolTip("Экспортировать результаты в CSV или XLSX")
+        self.btn_export.clicked.connect(self.export_results)
+        kwic_layout.addWidget(self.btn_export)
+
+        layout.addWidget(kwic_group)
+
         # === Results Section ===
         results_group = QGroupBox("📋 Результаты")
         results_layout = QHBoxLayout(results_group)
-        
-        # Main results text
+
+        # Tabs for standard results and KWIC table
+        self.results_tabs = QTabWidget()
+
+        # Tab 1: Standard results
         self.results_text = QTextEdit()
         self.results_text.setReadOnly(True)
         self.results_text.setFont(QFont("Helvetica", 12))
+        self.results_tabs.addTab(self.results_text, "Результаты")
+
+        # Tab 2: KWIC table
+        kwic_tab = QWidget()
+        kwic_tab_layout = QVBoxLayout(kwic_tab)
+        kwic_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.kwic_table = QTableWidget()
+        self.kwic_table.setColumnCount(4)
+        self.kwic_table.setHorizontalHeaderLabels(["Левый контекст", "Ключевое слово", "Правый контекст", "Документ"])
+        self.kwic_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.kwic_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.kwic_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.kwic_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.kwic_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.kwic_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.kwic_table.setAlternatingRowColors(True)
+        self.kwic_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.kwic_table.setFont(QFont("Helvetica", 11))
+        kwic_tab_layout.addWidget(self.kwic_table)
+
+        kwic_btn_layout = QHBoxLayout()
+        self.btn_copy_kwic = QPushButton("📋 Копировать таблицу")
+        self.btn_copy_kwic.clicked.connect(self.copy_kwic_table)
+        kwic_btn_layout.addWidget(self.btn_copy_kwic)
+        kwic_btn_layout.addStretch()
+        kwic_tab_layout.addLayout(kwic_btn_layout)
+
+        self.results_tabs.addTab(kwic_tab, "KWIC-таблица")
         
         # Found words panel
         words_frame = QFrame()
@@ -939,7 +1255,7 @@ class LemmaCheckApp(QMainWindow):
         
         # Use splitter for resizable panels
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.results_text)
+        splitter.addWidget(self.results_tabs)
         splitter.addWidget(words_frame)
         splitter.setSizes([700, 200])
         
@@ -1069,6 +1385,10 @@ class LemmaCheckApp(QMainWindow):
             self.doc_list.clear()
             self.results_text.clear()
             self.found_words_text.clear()
+            self.kwic_table.setRowCount(0)
+            self.last_results = []
+            self.last_query = ''
+            self.last_kwic_data = []
             self.update_status()
 
     def save_index(self):
@@ -1125,20 +1445,49 @@ class LemmaCheckApp(QMainWindow):
         self.status_label.setText("Выполняется поиск...")
         QApplication.processEvents()
         
+        # Determine KWIC settings
+        kwic_enabled = self.kwic_checkbox.isChecked()
+        kwic_ctx_idx = self.kwic_context_type.currentIndex()
+        if kwic_ctx_idx == 0:
+            kwic_context_type = 'words'
+            kwic_context_words = 5
+        elif kwic_ctx_idx == 1:
+            kwic_context_type = 'words'
+            kwic_context_words = 10
+        else:
+            kwic_context_type = 'sentence'
+            kwic_context_words = 5
+        kwic_filter = self.kwic_filter_input.text().strip()
+        
         # Run search in thread
-        self.search_thread = SearchThread(self.engine, query)
+        self.search_thread = SearchThread(
+            self.engine, query,
+            kwic_enabled=kwic_enabled,
+            kwic_context_type=kwic_context_type,
+            kwic_context_words=kwic_context_words,
+            kwic_filter=kwic_filter
+        )
         self.search_thread.result_ready.connect(self.on_search_results)
+        self.search_thread.kwic_ready.connect(self.on_kwic_results)
         self.search_thread.start()
 
     def on_search_results(self, results, query):
         """Handle search results from thread"""
         self.btn_search.setEnabled(True)
+        self.last_results = results
+        self.last_query = query
         self.results_text.clear()
         self.results_text.setPlainText("⏳ Обработка результатов...")
         QApplication.processEvents()
         
         self.display_results(results, query)
         self.update_status()
+
+    def on_kwic_results(self, kwic_data):
+        """Handle KWIC data from search thread"""
+        self.last_kwic_data = kwic_data
+        self._populate_kwic_table(kwic_data)
+        self.results_tabs.setCurrentIndex(1)
 
     def display_results(self, results: List[Tuple[str, int, str, List[int]]], query: str):
         self.results_text.clear()
@@ -1162,19 +1511,19 @@ class LemmaCheckApp(QMainWindow):
         # Formats
         title_fmt = QTextCharFormat()
         title_fmt.setFontWeight(700)
-        title_fmt.setForeground(QColor("#0066cc"))
+        title_fmt.setForeground(QColor("#ad1457"))
         
         count_fmt = QTextCharFormat()
-        count_fmt.setForeground(QColor("#666666"))
+        count_fmt.setForeground(QColor("#8e24aa"))
         
         para_num_fmt = QTextCharFormat()
-        para_num_fmt.setForeground(QColor("#888888"))
+        para_num_fmt.setForeground(QColor("#ce93d8"))
         para_num_fmt.setFontWeight(600)
         
         # Soft highlight - light blue background, readable
         highlight_fmt = QTextCharFormat()
-        highlight_fmt.setBackground(QColor("#b3e5fc"))  # Light blue
-        highlight_fmt.setForeground(QColor("#01579b"))  # Dark blue text
+        highlight_fmt.setBackground(QColor("#fce4ec"))  # Light pink
+        highlight_fmt.setForeground(QColor("#c2185b"))  # Deep pink text
         highlight_fmt.setFontWeight(600)
         
         normal_fmt = QTextCharFormat()
@@ -1252,27 +1601,27 @@ class LemmaCheckApp(QMainWindow):
         
         doc_title_fmt = QTextCharFormat()
         doc_title_fmt.setFontWeight(700)
-        doc_title_fmt.setForeground(QColor("#0066cc"))
+        doc_title_fmt.setForeground(QColor("#ad1457"))
         
         total_fmt = QTextCharFormat()
         total_fmt.setFontWeight(700)
-        total_fmt.setForeground(QColor("#2e7d32"))
+        total_fmt.setForeground(QColor("#c2185b"))
         
         stats_fmt = QTextCharFormat()
-        stats_fmt.setForeground(QColor("#555555"))
+        stats_fmt.setForeground(QColor("#6a1b4d"))
         
         variation_fmt = QTextCharFormat()
-        variation_fmt.setForeground(QColor("#7b1fa2"))  # Purple for variations count
+        variation_fmt.setForeground(QColor("#8e24aa"))  # Purple for variations count
         variation_fmt.setFontWeight(600)
         
         percent_fmt = QTextCharFormat()
-        percent_fmt.setForeground(QColor("#e65100"))  # Orange for percentage
+        percent_fmt.setForeground(QColor("#d81b60"))  # Hot pink for percentage
         
         ip10k_fmt = QTextCharFormat()
-        ip10k_fmt.setForeground(QColor("#00897b"))  # Teal for IP10K
+        ip10k_fmt.setForeground(QColor("#ab47bc"))  # Purple for IP10K
         
         ipm_fmt = QTextCharFormat()
-        ipm_fmt.setForeground(QColor("#0277bd"))  # Blue for IPM
+        ipm_fmt.setForeground(QColor("#ec407a"))  # Pink for IPM
         
         word_fmt = QTextCharFormat()
         
@@ -1338,6 +1687,62 @@ class LemmaCheckApp(QMainWindow):
         
         self.status_label.setText(f"Найдено {grand_total} совпадений ({grand_percent:.2f}%, IP10K: {grand_iptт:.1f}) в {len(results)} документах")
 
+        # Clear KWIC table if KWIC is not enabled (KWIC is built via on_kwic_results signal)
+        if not self.kwic_checkbox.isChecked():
+            self.kwic_table.setRowCount(0)
+            self.last_kwic_data = []
+
+    def _populate_kwic_table(self, kwic_data: List[Tuple[str, str, str, str, int]]):
+        """Populate KWIC table from pre-computed data (built in SearchThread)."""
+        self.kwic_table.setRowCount(len(kwic_data))
+        kw_font = QFont("Helvetica", 11, QFont.Weight.Bold)
+        right_align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        left_align = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        center_align = Qt.AlignmentFlag.AlignCenter
+
+        for row_idx, (fname, left, kw, right, pos) in enumerate(kwic_data):
+            # Left context (right-aligned)
+            item_left = QTableWidgetItem(left)
+            item_left.setTextAlignment(right_align)
+            self.kwic_table.setItem(row_idx, 0, item_left)
+            # Keyword (bold, centered)
+            item_kw = QTableWidgetItem(kw)
+            item_kw.setFont(kw_font)
+            item_kw.setTextAlignment(center_align)
+            item_kw.setForeground(QColor("#880e4f"))
+            item_kw.setBackground(QColor("#fce4ec"))
+            self.kwic_table.setItem(row_idx, 1, item_kw)
+            # Right context (left-aligned)
+            item_right = QTableWidgetItem(right)
+            item_right.setTextAlignment(left_align)
+            self.kwic_table.setItem(row_idx, 2, item_right)
+            # Document
+            item_doc = QTableWidgetItem(fname)
+            item_doc.setTextAlignment(left_align)
+            self.kwic_table.setItem(row_idx, 3, item_doc)
+
+        self.kwic_table.resizeRowsToContents()
+        self.status_label.setText(
+            f"KWIC: {len(kwic_data)} конкорданс{'ов' if len(kwic_data) != 1 else ''}"
+        )
+
+    def copy_kwic_table(self):
+        """Copy KWIC table to clipboard as tab-separated text."""
+        rows = self.kwic_table.rowCount()
+        if rows == 0:
+            return
+        lines = ["Левый контекст\tКлючевое слово\tПравый контекст\tДокумент"]
+        for r in range(rows):
+            cols = []
+            for c in range(4):
+                item = self.kwic_table.item(r, c)
+                cols.append(item.text() if item else '')
+            lines.append('\t'.join(cols))
+        text = '\n'.join(lines)
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        self.status_label.setText(f"KWIC-таблица скопирована ({rows} строк)")
+
     def _extract_phrase_at_position(self, text: str, start_pos: int, word_count: int) -> str:
         """Extract a phrase starting at given position with given number of words"""
         words = []
@@ -1388,6 +1793,156 @@ class LemmaCheckApp(QMainWindow):
         if last_end < len(context):
             cursor.insertText(context[last_end:], normal_fmt)
 
+    # ==================== Export Methods ====================
+
+    def export_results(self):
+        """Show export dialog and perform export."""
+        if not self.last_results:
+            QMessageBox.information(self, "Информация", "Сначала выполните поиск.")
+            return
+
+        has_kwic = len(self.last_kwic_data) > 0
+        dialog = ExportDialog(self, has_kwic=has_kwic)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        export_type = dialog.get_export_type()
+        fmt = dialog.get_format()
+
+        # Build headers and rows
+        if export_type == 0:
+            headers, rows = self._compute_results_table()
+        elif export_type == 1:
+            headers, rows = self._compute_concordance_table()
+        else:
+            headers, rows = self._compute_summary()
+
+        if not rows:
+            QMessageBox.information(self, "Информация", "Нет данных для экспорта.")
+            return
+
+        # Generate default filename
+        now = datetime.now()
+        type_label = ['results', 'concordance', 'summary'][export_type]
+        default_name = f"lemmaCheck_export_{type_label}_{now.strftime('%Y%m%d_%H%M')}.{fmt}"
+
+        ext_filter = "CSV (*.csv)" if fmt == 'csv' else "Excel (*.xlsx)"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Экспорт данных", default_name, ext_filter
+        )
+        if not filepath:
+            return
+
+        # Run export in background thread
+        self.export_thread = ExportThread(filepath, fmt, headers, rows)
+        self.export_thread.progress.connect(lambda msg: self.status_label.setText(msg))
+        self.export_thread.done.connect(self._on_export_done)
+        self.export_thread.error.connect(self._on_export_error)
+        self.export_thread.start()
+
+    def _on_export_done(self, filepath: str):
+        """Handle export completion."""
+        filename = os.path.basename(filepath)
+        self.status_label.setText(f"Экспорт завершён: {filename}")
+        QMessageBox.information(self, "Экспорт", f"Данные успешно экспортированы:\n{filepath}")
+
+    def _on_export_error(self, error: str):
+        """Handle export error."""
+        self.status_label.setText("Ошибка экспорта")
+        QMessageBox.critical(self, "Ошибка экспорта", error)
+
+    def _compute_results_table(self) -> Tuple[List[str], List[list]]:
+        """Compute results table data for export.
+        Columns: Лемма, Словоформа, Документ, Абс.частота, %, IP10K, IPM, TF-IDF
+        """
+        headers = ["Лемма", "Словоформа", "Документ", "Абс. частота", "%", "IP10K", "IPM", "TF-IDF"]
+        rows: List[list] = []
+
+        if not self.last_results or not self.last_query:
+            return headers, rows
+
+        query_lemmas = self.engine.get_query_lemmas(self.last_query)
+        query_lemmas_set = set(query_lemmas)
+        is_phrase = len(query_lemmas) > 1
+        lemma_str = ' '.join(query_lemmas)
+
+        for doc_id, count, filename, positions in self.last_results:
+            if doc_id not in self.engine.documents:
+                continue
+            full_text = self.engine.documents[doc_id]['text']
+            word_count = self.engine.documents[doc_id]['word_count']
+
+            # Collect word forms and their frequencies
+            word_forms: Dict[str, int] = defaultdict(int)
+            if is_phrase:
+                for pos in positions:
+                    phrase = self._extract_phrase_at_position(full_text, pos, len(query_lemmas))
+                    if phrase:
+                        word_forms[phrase.lower()] += 1
+            else:
+                for match in re.finditer(WORD_PATTERN, full_text):
+                    word = match.group()
+                    lemma = self.engine._lemmatize_word(word)
+                    if lemma in query_lemmas_set:
+                        word_forms[word.lower()] += 1
+
+            # TF-IDF sum for query lemmas in this doc
+            tfidf_sum = sum(self.engine._calculate_tfidf(l, doc_id) for l in query_lemmas_set)
+
+            for form, freq in sorted(word_forms.items(), key=lambda x: -x[1]):
+                pct = (freq / word_count * 100) if word_count > 0 else 0
+                ip10k = (freq / word_count * 10_000) if word_count > 0 else 0
+                ipm = (freq / word_count * 1_000_000) if word_count > 0 else 0
+                rows.append([
+                    lemma_str, form, filename, freq,
+                    round(pct, 4), round(ip10k, 2), round(ipm, 1), round(tfidf_sum, 6)
+                ])
+
+        return headers, rows
+
+    def _compute_concordance_table(self) -> Tuple[List[str], List[list]]:
+        """Compute concordance (KWIC) table data for export."""
+        headers = ["Левый контекст", "Ключевое слово", "Правый контекст", "Документ", "Позиция"]
+        rows: List[list] = []
+
+        for fname, left, kw, right, pos in self.last_kwic_data:
+            rows.append([left, kw, right, fname, pos])
+
+        return headers, rows
+
+    def _compute_summary(self) -> Tuple[List[str], List[list]]:
+        """Compute summary report data for export."""
+        headers = ["Параметр", "Значение"]
+        now = datetime.now()
+        query = self.last_query or ''
+        lang_mode = "Казахский" if self.engine.force_kazakh else "Авто (Рус/Англ/Каз)"
+        total_docs = len(self.engine.documents)
+        total_words = self.engine.total_words
+        match_docs = len(self.last_results) if self.last_results else 0
+        total_matches = sum(r[1] for r in self.last_results) if self.last_results else 0
+
+        # Corpus-wide frequency stats
+        grand_pct = (total_matches / total_words * 100) if total_words > 0 else 0
+        grand_ip10k = (total_matches / total_words * 10_000) if total_words > 0 else 0
+        grand_ipm = (total_matches / total_words * 1_000_000) if total_words > 0 else 0
+
+        rows: List[list] = [
+            ["Дата и время", now.strftime("%Y-%m-%d %H:%M:%S")],
+            ["Поисковый запрос", query],
+            ["Языковой режим", lang_mode],
+            ["Документов в корпусе", total_docs],
+            ["Слов в корпусе", total_words],
+            ["Документов с совпадениями", match_docs],
+            ["Всего совпадений", total_matches],
+            ["Частота (%)", round(grand_pct, 4)],
+            ["IP10K", round(grand_ip10k, 2)],
+            ["IPM", round(grand_ipm, 1)],
+            ["KWIC-строк", len(self.last_kwic_data)],
+            ["Версия LemmaCheck", "1.0"],
+        ]
+        return headers, rows
+
     def open_file(self, filepath: str):
         try:
             if platform.system() == 'Darwin':
@@ -1413,14 +1968,155 @@ class LemmaCheckApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    
-    # Dark palette (optional, comment out for light theme)
-    # from PyQt6.QtGui import QPalette
-    # palette = QPalette()
-    # palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-    # palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
-    # app.setPalette(palette)
-    
+
+    # Barbie pink palette
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#fff0f5"))          # Lavender blush background
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#4a1942"))      # Deep plum text
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))             # White input fields
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#fce4ec"))   # Light pink alternating rows
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#f8bbd0"))     # Pink tooltips
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#4a1942"))     # Deep plum tooltip text
+    palette.setColor(QPalette.ColorRole.Text, QColor("#4a1942"))            # Deep plum text
+    palette.setColor(QPalette.ColorRole.Button, QColor("#f8bbd0"))          # Pink buttons
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#880e4f"))      # Dark pink button text
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#ff4081"))      # Hot pink bright text
+    palette.setColor(QPalette.ColorRole.Link, QColor("#d81b60"))            # Pink links
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#f06292"))       # Pink selection
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff")) # White on selection
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#ce93d8")) # Soft purple placeholder
+    app.setPalette(palette)
+
+    # Global stylesheet for Barbie pink theme
+    app.setStyleSheet("""
+        QGroupBox {
+            border: 2px solid #f48fb1;
+            border-radius: 8px;
+            margin-top: 10px;
+            padding-top: 14px;
+            font-weight: bold;
+            color: #880e4f;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 12px;
+            padding: 0 6px;
+            color: #ad1457;
+        }
+        QPushButton {
+            background-color: #f48fb1;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 6px 14px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #f06292;
+        }
+        QPushButton:pressed {
+            background-color: #ec407a;
+        }
+        QPushButton:disabled {
+            background-color: #f8bbd0;
+            color: #e0e0e0;
+        }
+        QLineEdit, QComboBox {
+            border: 2px solid #f48fb1;
+            border-radius: 6px;
+            padding: 4px 8px;
+            background: white;
+        }
+        QLineEdit:focus, QComboBox:focus {
+            border-color: #ec407a;
+        }
+        QListWidget {
+            border: 2px solid #f8bbd0;
+            border-radius: 6px;
+            background: white;
+        }
+        QTextEdit {
+            border: 2px solid #f8bbd0;
+            border-radius: 6px;
+            background: white;
+        }
+        QTableWidget {
+            border: 2px solid #f8bbd0;
+            border-radius: 6px;
+            gridline-color: #fce4ec;
+            background: white;
+        }
+        QHeaderView::section {
+            background-color: #f8bbd0;
+            color: #880e4f;
+            padding: 4px;
+            border: 1px solid #f48fb1;
+            font-weight: bold;
+        }
+        QTabWidget::pane {
+            border: 2px solid #f48fb1;
+            border-radius: 6px;
+            background: white;
+        }
+        QTabBar::tab {
+            background: #fce4ec;
+            color: #880e4f;
+            padding: 6px 16px;
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
+            margin-right: 2px;
+        }
+        QTabBar::tab:selected {
+            background: #f48fb1;
+            color: white;
+        }
+        QTabBar::tab:hover {
+            background: #f06292;
+            color: white;
+        }
+        QProgressBar {
+            border: 2px solid #f48fb1;
+            border-radius: 6px;
+            text-align: center;
+            background: #fce4ec;
+            color: #880e4f;
+        }
+        QProgressBar::chunk {
+            background-color: #f06292;
+            border-radius: 4px;
+        }
+        QCheckBox {
+            color: #880e4f;
+            spacing: 6px;
+        }
+        QCheckBox::indicator:checked {
+            background-color: #ec407a;
+            border: 2px solid #ad1457;
+            border-radius: 3px;
+        }
+        QCheckBox::indicator:unchecked {
+            background-color: white;
+            border: 2px solid #f48fb1;
+            border-radius: 3px;
+        }
+        QLabel {
+            color: #4a1942;
+        }
+        QScrollBar:vertical {
+            background: #fce4ec;
+            width: 12px;
+            border-radius: 6px;
+        }
+        QScrollBar::handle:vertical {
+            background: #f48fb1;
+            border-radius: 6px;
+            min-height: 20px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #f06292;
+        }
+    """)
+
     window = LemmaCheckApp()
     window.show()
     sys.exit(app.exec())

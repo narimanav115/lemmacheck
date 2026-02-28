@@ -1,15 +1,18 @@
 # Copilot Instructions for LemmaCheck
 
 ## Project Overview
-LemmaCheck is a Python desktop application for full-text lemma-based search across documents (DOCX, DOC, PDF, TXT, XLSX, XLS). It uses PyQt6 for the GUI and supports trilingual lemmatization (Russian via pymorphy3, English via nltk/WordNetLemmatizer, Kazakh via built-in suffix stemmer).
+LemmaCheck is a Python desktop application for full-text lemma-based search across documents (DOCX, DOC, PDF, TXT, XLSX, XLS). It uses PyQt6 for the GUI and supports trilingual lemmatization (Russian via pymorphy3, English via nltk/WordNetLemmatizer, Kazakh via built-in suffix stemmer). Features KWIC concordance, data export (CSV/XLSX), and a Barbie pink UI theme.
 
 ## Architecture
-- **Single-file app**: All code lives in `app.py` (~1300 lines)
-- **GUI framework**: PyQt6 (not tkinter despite the instruction.md reference)
+- **Single-file app**: All code lives in `app.py` (~2100 lines)
+- **GUI framework**: PyQt6 with Fusion style + Barbie pink QPalette & QSS theme
 - **Key classes**:
-  - `LemmaSearchEngine` — inverted index, TF-IDF ranking, phrase search
+  - `LemmaSearchEngine` — inverted index, TF-IDF ranking, phrase search, KWIC concordance
+  - `KazakhStemmer` — rule-based suffix stemmer for Kazakh
   - `IndexingThread(QThread)` — background document indexing
-  - `SearchThread(QThread)` — background search execution
+  - `SearchThread(QThread)` — background search + KWIC concordance generation
+  - `ExportDialog(QDialog)` — export type/format selection dialog
+  - `ExportThread(QThread)` — background CSV/XLSX export
   - `LemmaCheckApp(QMainWindow)` — main window and UI logic
 - **Document parsers**: standalone functions (`extract_text_from_*`)
 
@@ -27,7 +30,10 @@ LemmaCheck is a Python desktop application for full-text lemma-based search acro
 - **Hyphenated words**: Index both the full compound and individual parts
 - **Phrase search**: Sequential lemma matching with `max_distance` parameter
 - **Threading**: `QThread` with `pyqtSignal` for progress/results — never block the UI thread
+- **KWIC concordance**: Built in `SearchThread`, emits `kwic_ready` signal with `(filename, left, keyword, right, position)` tuples
+- **Export**: `ExportDialog` → `ExportThread` pipeline; 3 types (results table, concordance, summary report); CSV/XLSX formats
 - **Index persistence**: JSON save/load for the inverted index
+- **UI theme**: Barbie pink palette via `QPalette` + global `QSS` stylesheet in `main()`
 
 ## Dependencies
 See `requirements.txt`: pymorphy3, nltk, python-docx, PyMuPDF, PyQt6, chardet, openpyxl, xlrd
@@ -39,3 +45,4 @@ See `requirements.txt`: pymorphy3, nltk, python-docx, PyMuPDF, PyQt6, chardet, o
 - Preserve the existing TF-IDF and phrase-search logic unless asked to change it
 - Use `QApplication.processEvents()` sparingly — prefer `QThread` + signals
 - Platform-specific code (Windows COM, macOS textutil) must be guarded by `platform.system()` checks
+- Keep the Barbie pink color palette consistent — all new UI elements should use the pink/purple/plum color scheme

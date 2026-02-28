@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 LemmaCheck - Full-text search application with lemmatization support
-Supports Russian (pymorphy3) and English (nltk) lemmatization
+Supports Russian (pymorphy3), English (nltk) and Kazakh (built-in stemmer) lemmatization
 Uses PyQt6 for GUI
 """
 
@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QListWidget, QTextEdit, QLabel,
     QFileDialog, QMessageBox, QProgressBar, QGroupBox, QSplitter,
-    QAbstractItemView, QListWidgetItem, QFrame
+    QAbstractItemView, QListWidgetItem, QFrame, QCheckBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCharFormat, QColor, QTextCursor, QBrush
@@ -84,6 +84,87 @@ try:
     lemmatizer = WordNetLemmatizer()
 except ImportError:
     lemmatizer = None
+
+
+# ==================== Kazakh Stemmer ====================
+
+# Kazakh-specific Cyrillic characters (not present in Russian)
+KAZAKH_SPECIFIC_CHARS = set('ӘәҒғҚқҢңӨөҰұҮүҺһІі')
+
+# Regex character class for all Cyrillic including Kazakh-specific letters
+CYRILLIC_CHARS = r'а-яёА-ЯЁӘәҒғҚқҢңӨөҰұҮүҺһІі'
+# Full word pattern: Cyrillic + Latin + hyphenated compounds
+WORD_PATTERN = r'[' + CYRILLIC_CHARS + r'a-zA-Z]+(?:-[' + CYRILLIC_CHARS + r'a-zA-Z]+)*'
+
+
+class KazakhStemmer:
+    """Rule-based suffix stemmer for Kazakh language.
+    
+    Kazakh is agglutinative — words are formed by appending suffixes to stems.
+    This stemmer strips common inflectional and derivational suffixes.
+    """
+
+    # Plural suffixes
+    _PLURAL = ['лар', 'лер', 'дар', 'дер', 'тар', 'тер']
+
+    # Case suffixes (genitive, dative, accusative, locative, ablative, instrumental)
+    _CASE = [
+        'ның', 'нің',           # genitive
+        'ға', 'ге', 'қа', 'ке', # dative
+        'ны', 'ні', 'ды', 'ді', 'ты', 'ті',  # accusative
+        'да', 'де', 'та', 'те', # locative
+        'дан', 'ден', 'тан', 'тен', 'нан', 'нен',  # ablative
+        'мен', 'бен', 'пен',   # instrumental
+    ]
+
+    # Possessive suffixes
+    _POSSESSIVE = [
+        'ым', 'ім', 'м',       # 1st person sing
+        'ың', 'ің', 'ң',       # 2nd person sing
+        'ы', 'і', 'сы', 'сі',  # 3rd person sing
+        'мыз', 'міз',          # 1st person plur
+        'ңыз', 'ңіз',          # 2nd person formal
+        'дары', 'дері', 'тары', 'тері', 'лары', 'лері',  # 3rd person plur
+    ]
+
+    # Verbal suffixes (common tense/mood markers)
+    _VERBAL = [
+        'ған', 'ген', 'қан', 'кен',   # past participle
+        'атын', 'етін',                # habitual
+        'йтын', 'йтін',               # habitual
+        'ушы', 'уші',                  # agent noun
+        'лық', 'лік', 'дық', 'дік', 'тық', 'тік',  # abstract noun
+        'шы', 'ші',                    # agent/profession
+        'сыз', 'сіз',                  # privative (without)
+    ]
+
+    def __init__(self):
+        # Build suffix list sorted by length (longest first) for greedy matching
+        all_suffixes = (self._PLURAL + self._CASE + self._POSSESSIVE + self._VERBAL)
+        self._suffixes = sorted(set(all_suffixes), key=len, reverse=True)
+
+    def stem(self, word: str) -> str:
+        """Strip Kazakh suffixes from a word to approximate its lemma."""
+        word = word.lower().strip()
+        if len(word) < 3:
+            return word
+
+        # Apply up to 3 rounds of suffix stripping (Kazakh can stack multiple suffixes)
+        for _ in range(3):
+            stripped = False
+            for suffix in self._suffixes:
+                if word.endswith(suffix) and len(word) - len(suffix) >= 2:
+                    word = word[:-len(suffix)]
+                    stripped = True
+                    break
+            if not stripped:
+                break
+
+        return word
+
+
+# Global Kazakh stemmer instance
+kaz_stemmer = KazakhStemmer()
 
 
 # ==================== Document Parsers ====================
@@ -244,9 +325,14 @@ class LemmaSearchEngine:
         self.total_docs: int = 0
         self.total_words: int = 0
         self._lemma_cache: Dict[str, str] = {}
+        self.force_kazakh: bool = False
 
     def _is_cyrillic(self, word: str) -> bool:
-        return bool(re.search(r'[а-яёА-ЯЁ]', word))
+        return bool(re.search(r'[а-яёА-ЯЁӘәҒғҚқҢңӨөҰұҮүҺһІі]', word))
+
+    def _is_kazakh(self, word: str) -> bool:
+        """Detect Kazakh by presence of Kazakh-specific Cyrillic characters."""
+        return bool(KAZAKH_SPECIFIC_CHARS & set(word))
 
     def _is_latin(self, word: str) -> bool:
         return bool(re.search(r'[a-zA-Z]', word))
@@ -266,10 +352,15 @@ class LemmaSearchEngine:
         if word_lower in self._lemma_cache:
             return self._lemma_cache[word_lower]
         lemma = word_lower
-        if self._is_cyrillic(word_lower) and morph:
-            parsed = morph.parse(word_lower)
-            if parsed:
-                lemma = parsed[0].normal_form
+        if self._is_cyrillic(word_lower):
+            if self.force_kazakh or self._is_kazakh(word_lower):
+                # Kazakh mode (forced or detected) — use Kazakh stemmer
+                lemma = kaz_stemmer.stem(word_lower)
+            elif morph:
+                # Standard Russian Cyrillic — use pymorphy3
+                parsed = morph.parse(word_lower)
+                if parsed:
+                    lemma = parsed[0].normal_form
         elif self._is_latin(word_lower) and lemmatizer:
             pos = self._get_wordnet_pos(word_lower)
             lemma = lemmatizer.lemmatize(word_lower, pos)
@@ -279,8 +370,8 @@ class LemmaSearchEngine:
     def lemmatize(self, text: str) -> List[Tuple[str, str, int]]:
         """Tokenize and lemmatize text, supporting hyphenated words"""
         words = []
-        # Match words including hyphenated compounds (e.g., "Three-cycle", "научно-технический")
-        for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', text):
+        # Match words including hyphenated compounds (e.g., "Three-cycle", "научно-технический", "ғылыми-техникалық")
+        for match in re.finditer(WORD_PATTERN, text):
             word = match.group()
             position = match.start()
             
@@ -638,7 +729,8 @@ class LemmaSearchEngine:
             'inverted_index': {k: dict(v) for k, v in self.inverted_index.items()},
             'doc_frequency': dict(self.doc_frequency),
             'total_docs': self.total_docs,
-            'total_words': self.total_words
+            'total_words': self.total_words,
+            'force_kazakh': self.force_kazakh
         }
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -654,6 +746,7 @@ class LemmaSearchEngine:
         self.doc_frequency = defaultdict(int, data['doc_frequency'])
         self.total_docs = data['total_docs']
         self.total_words = data['total_words']
+        self.force_kazakh = data.get('force_kazakh', False)
         self._lemma_cache.clear()
 
 
@@ -805,6 +898,14 @@ class LemmaCheckApp(QMainWindow):
         self.btn_search.clicked.connect(self.search)
         search_layout.addWidget(self.btn_search)
 
+        self.kazakh_checkbox = QCheckBox("Казахский язык")
+        self.kazakh_checkbox.setToolTip(
+            "Все кириллические слова обрабатываются казахским стеммером\n"
+            "(для слов без специфических казахских букв, напр. 'бала')"
+        )
+        self.kazakh_checkbox.toggled.connect(self.on_kazakh_toggled)
+        search_layout.addWidget(self.kazakh_checkbox)
+
         layout.addWidget(search_group)
 
         # === Results Section ===
@@ -909,6 +1010,35 @@ class LemmaCheckApp(QMainWindow):
         self.set_buttons_enabled(True)
         self.update_status()
 
+    def on_kazakh_toggled(self, checked: bool):
+        """Toggle Kazakh-only mode: re-index all documents with Kazakh stemmer."""
+        self.engine.force_kazakh = checked
+        self.engine._lemma_cache.clear()
+
+        if not self.engine.documents:
+            return
+
+        # Re-index all documents with the new language setting
+        stored = [(doc_id, info['text'], info['filename'])
+                  for doc_id, info in self.engine.documents.items()]
+
+        # Reset engine state
+        self.engine.documents.clear()
+        self.engine.inverted_index.clear()
+        self.engine.doc_frequency.clear()
+        self.engine.total_docs = 0
+        self.engine.total_words = 0
+
+        for doc_id, text, filename in stored:
+            self.engine.add_document(doc_id, text, filename)
+
+        self.update_status()
+        mode = "казахский" if checked else "авто"
+        self.status_label.setText(
+            f"Режим: {mode} | Документов: {len(self.engine.documents)} | "
+            f"Индексировано слов: {self.engine.total_words}"
+        )
+
     def cancel_indexing(self):
         if self.indexing_thread:
             self.indexing_thread.cancelled = True
@@ -970,6 +1100,10 @@ class LemmaCheckApp(QMainWindow):
                 self.doc_list.clear()
                 for doc in self.engine.documents.values():
                     self.doc_list.addItem(doc['filename'])
+                # Sync checkbox with loaded index setting
+                self.kazakh_checkbox.blockSignals(True)
+                self.kazakh_checkbox.setChecked(self.engine.force_kazakh)
+                self.kazakh_checkbox.blockSignals(False)
                 self.update_status()
                 QMessageBox.information(self, "Успешно", "Индекс загружен.")
             except Exception as e:
@@ -1068,7 +1202,7 @@ class LemmaCheckApp(QMainWindow):
             else:
                 # For single word search, count all occurrences
                 total_count = 0
-                for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', full_text):
+                for match in re.finditer(WORD_PATTERN, full_text):
                     word = match.group()
                     lemma = self.engine._lemmatize_word(word)
                     if lemma in query_lemmas_set:
@@ -1089,7 +1223,7 @@ class LemmaCheckApp(QMainWindow):
                     self._highlight_phrases_in_context(cursor, context_text, query_lemmas, highlight_fmt, normal_fmt)
                 else:
                     last_end = 0
-                    for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', context_text):
+                    for match in re.finditer(WORD_PATTERN, context_text):
                         word = match.group()
                         start = match.start()
                         
@@ -1207,7 +1341,7 @@ class LemmaCheckApp(QMainWindow):
     def _extract_phrase_at_position(self, text: str, start_pos: int, word_count: int) -> str:
         """Extract a phrase starting at given position with given number of words"""
         words = []
-        for match in re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', text[start_pos:]):
+        for match in re.finditer(WORD_PATTERN, text[start_pos:]):
             words.append(match.group())
             if len(words) >= word_count:
                 break
@@ -1217,7 +1351,7 @@ class LemmaCheckApp(QMainWindow):
                                        highlight_fmt, normal_fmt):
         """Highlight phrase matches in context text"""
         # Find all word positions in context
-        word_matches = list(re.finditer(r'[а-яёА-ЯЁa-zA-Z]+(?:-[а-яёА-ЯЁa-zA-Z]+)*', context))
+        word_matches = list(re.finditer(WORD_PATTERN, context))
         
         if not word_matches:
             cursor.insertText(context, normal_fmt)
